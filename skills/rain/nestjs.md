@@ -131,6 +131,27 @@ export class InternalTaskCloseRequestBodyDto {
 }
 ```
 
+Every array gets `@ArrayMaxSize` and every string `@MaxLength`. Query strings arrive as strings, so a boolean query flag needs an explicit transform:
+
+```ts
+const MAX_LABELS = 50;
+
+export class TaskSearchRequestQueryDto {
+  @IsOptional()
+  @Transform(({ value }) => value === 'true')
+  @IsBoolean()
+  assignedToMe?: boolean;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(MAX_LABELS)
+  @IsString({ each: true })
+  labels?: string[];
+}
+```
+
+Path values come in through `@Param()`, never `@Query()`. Required query values sit on a DTO, never a bare `@Query('memberId')` that accepts a missing value. The global pipe already validates, so handlers do not add their own `ValidationPipe`.
+
 ## Controllers
 
 ```ts
@@ -188,6 +209,41 @@ private async lockMember(memberOpts: { refId: string } | Member, em: EntityManag
   return member;
 }
 ```
+
+## MikroORM gotchas
+
+- **Pass `em` into every helper the transaction calls.** A helper that uses the injected `EntityManager` or a repository runs on another context: it reads pre-transaction rows, and its writes commit outside your rollback. Two `begin` lines in the query log for one use case means a helper is on the wrong `em`.
+- **`nativeUpdate` skips the identity map.** Entities you already loaded keep the old value, and the next `flush` writes the old value back. In one use case, load-and-assign, or `nativeUpdate` and stop using the loaded entities.
+- **`flush` is not `commit`.** Inside `transactional`, `flush` only sends the SQL; the block commits or rolls back. Use the `transactional(async (em) => ...)` block over manual `begin` / `commit` / `rollback`.
+- **Queue and cron handlers need a context.** Decorate the handler with `@CreateRequestContext()`; there is no HTTP request to fork one from.
+- **Map `NotFoundError` to `404`** in the global exception filter, so `findOneOrFail` never answers `500`.
+
+## Cache locks and counters
+
+The Nest cache manager has no `NX`; use the Redis client underneath.
+
+```ts
+const lockId = randomUUID();
+await redis.set(key, lockId, { NX: true, PX: expiryMs });
+if ((await redis.get(key)) !== lockId) return null; // NOTE: Another caller holds the lock.
+
+// Rate limit: the first caller sets the window, everyone increments.
+await redis.set(key, '0', { NX: true, EX: WINDOW_SECONDS });
+const count = await redis.incr(key);
+```
+
+Keys follow `<service>:<env>:<workspace>:<thing>`.
+
+## Decimals
+
+`decimal.js` defaults to 20 significant digits and truncates past that. Export one clone and use it everywhere:
+
+```ts
+// WARNING: Default Decimal precision truncates large amounts. Use Decimal78.
+export const Decimal78 = Decimal.clone({ precision: 78 });
+```
+
+Columns are `numeric(39, 18)`; the ORM returns them as strings, so convert at the entity edge and serialize with `.toString()` on the `Decimal`, which drops trailing zeros.
 
 ## Webhooks
 
