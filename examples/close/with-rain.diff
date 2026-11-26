@@ -1,0 +1,216 @@
+diff --git a/src/app.module.ts b/src/app.module.ts
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,9 +1,12 @@
+ import { MikroOrmModule } from '@mikro-orm/nestjs';
+-import { Module } from '@nestjs/common';
++import { Module, ValidationPipe } from '@nestjs/common';
+ import { ConfigModule } from '@nestjs/config';
++import { APP_PIPE } from '@nestjs/core';
++import { validate } from './config/env.validation';
+ import { TasksModule } from './tasks/tasks.module';
+ 
+ @Module({
+-  imports: [ConfigModule.forRoot({ isGlobal: true }), MikroOrmModule.forRoot(), TasksModule],
++  imports: [ConfigModule.forRoot({ isGlobal: true, validate }), MikroOrmModule.forRoot(), TasksModule],
++  providers: [{ provide: APP_PIPE, useValue: new ValidationPipe({ whitelist: true, transform: true }) }],
+ })
+ export class AppModule {}
+diff --git a/src/auth/auth.config.ts b/src/auth/auth.config.ts
+--- a/src/auth/auth.config.ts
++++ b/src/auth/auth.config.ts
+@@ -0,0 +1,6 @@
++import { registerAs } from '@nestjs/config';
++
++export const AuthConfig = registerAs('auth', () => ({
++  internalApiKey: process.env.INTERNAL_API_KEY!,
++}));
++export default AuthConfig;
+diff --git a/src/auth/guards/internal-api-key.guard.ts b/src/auth/guards/internal-api-key.guard.ts
+--- a/src/auth/guards/internal-api-key.guard.ts
++++ b/src/auth/guards/internal-api-key.guard.ts
+@@ -0,0 +1,27 @@
++import { timingSafeEqual } from 'node:crypto';
++import type { IncomingMessage } from 'node:http';
++
++import { CanActivate, ExecutionContext, ForbiddenException, Inject, Injectable } from '@nestjs/common';
++import { ConfigType } from '@nestjs/config';
++
++import AuthConfig from '../auth.config';
++
++@Injectable()
++export class InternalApiKeyGuard implements CanActivate {
++  private readonly key: Buffer;
++
++  constructor(@Inject(AuthConfig.KEY) config: ConfigType<typeof AuthConfig>) {
++    this.key = Buffer.from(config.internalApiKey);
++  }
++
++  canActivate(context: ExecutionContext): boolean {
++    const header = context.switchToHttp().getRequest<IncomingMessage>().headers['x-internal-api-key'];
++    const given = Buffer.from(typeof header === 'string' ? header : '');
++
++    // NOTE: Compare equal-length buffers either way so response time does not reveal the key length.
++    const matches = timingSafeEqual(given.length === this.key.length ? given : this.key, this.key);
++    if (given.length !== this.key.length || !matches) throw new ForbiddenException();
++
++    return true;
++  }
++}
+diff --git a/src/config/env.validation.ts b/src/config/env.validation.ts
+--- a/src/config/env.validation.ts
++++ b/src/config/env.validation.ts
+@@ -0,0 +1,27 @@
++import { plainToInstance } from 'class-transformer';
++import { IsNotEmpty, IsString, MinLength, validateSync } from 'class-validator';
++
++const MIN_INTERNAL_API_KEY_LENGTH = 32;
++
++export class EnvironmentVariables {
++  // Shared secret the HR service sends in the x-internal-api-key header.
++  @IsNotEmpty()
++  @IsString()
++  @MinLength(MIN_INTERNAL_API_KEY_LENGTH)
++  INTERNAL_API_KEY!: string;
++}
++
++export function validate(config: Record<string, unknown>): EnvironmentVariables {
++  const env = plainToInstance(EnvironmentVariables, config);
++  const errors = validateSync(env, {
++    skipMissingProperties: false,
++    skipNullProperties: false,
++    skipUndefinedProperties: false,
++  });
++  if (errors.length > 0) {
++    const violations = errors.flatMap((error) => Object.values(error.constraints ?? {}));
++    throw new Error(`Invalid Environment: ${violations.join('; ')}`);
++  }
++
++  return env;
++}
+diff --git a/src/tasks/controllers/internal.task.controller.ts b/src/tasks/controllers/internal.task.controller.ts
+--- a/src/tasks/controllers/internal.task.controller.ts
++++ b/src/tasks/controllers/internal.task.controller.ts
+@@ -0,0 +1,26 @@
++import { Body, Controller, HttpCode, HttpStatus, Param, Post, UseGuards } from '@nestjs/common';
++
++import { InternalApiKeyGuard } from '../../auth/guards/internal-api-key.guard';
++import { TaskService } from '../services/task.service';
++
++import {
++  InternalTaskCloseRequestBodyDto,
++  InternalTaskCloseRequestParamsDto,
++  InternalTaskCloseResponseBodyDto,
++} from '../dtos/internal-task-close-request.dto';
++
++// Called by the HR service to close tasks of members who leave the company.
++@Controller('internal/task')
++@UseGuards(InternalApiKeyGuard)
++export class InternalTaskController {
++  constructor(private readonly taskService: TaskService) {}
++
++  @Post(':task/close')
++  @HttpCode(HttpStatus.OK)
++  async close(
++    @Param() params: InternalTaskCloseRequestParamsDto,
++    @Body() body: InternalTaskCloseRequestBodyDto,
++  ): Promise<InternalTaskCloseResponseBodyDto> {
++    return await this.taskService.close({ id: params.task }, { externalId: body.memberId });
++  }
++}
+diff --git a/src/tasks/dtos/internal-task-close-request.dto.ts b/src/tasks/dtos/internal-task-close-request.dto.ts
+--- a/src/tasks/dtos/internal-task-close-request.dto.ts
++++ b/src/tasks/dtos/internal-task-close-request.dto.ts
+@@ -0,0 +1,24 @@
++import { Type } from 'class-transformer';
++import { IsInt, IsNotEmpty, IsPositive, IsString } from 'class-validator';
++
++import { TaskStatus } from '../enums/task-status.enum';
++
++export class InternalTaskCloseRequestParamsDto {
++  @IsNotEmpty()
++  @Type(() => Number)
++  @IsInt()
++  @IsPositive()
++  task!: number;
++}
++
++export class InternalTaskCloseRequestBodyDto {
++  // Member id in the HR service (Member.externalId).
++  @IsNotEmpty()
++  @IsString()
++  memberId!: string;
++}
++
++export class InternalTaskCloseResponseBodyDto {
++  id!: number;
++  status!: TaskStatus;
++}
+diff --git a/src/tasks/services/task.service.ts b/src/tasks/services/task.service.ts
+--- a/src/tasks/services/task.service.ts
++++ b/src/tasks/services/task.service.ts
+@@ -0,0 +1,44 @@
++import { EntityManager, LockMode } from '@mikro-orm/postgresql';
++import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
++
++import { Member } from '../entities/member.entity';
++import { Task } from '../entities/task.entity';
++
++import { TaskStatus } from '../enums/task-status.enum';
++
++@Injectable()
++export class TaskService {
++  constructor(private readonly entityManager: EntityManager) {}
++
++  async close(
++    taskOpts: { id: number },
++    memberOpts: { externalId: string },
++  ): Promise<{ id: number; status: TaskStatus }> {
++    return await this.entityManager.transactional(async (em) => {
++      const member = await this.lockMember(memberOpts, em);
++
++      // NOTE: Read the task after the member lock so a concurrent close sees the committed status.
++      const task = await em.findOne(Task, { id: taskOpts.id, assignee: member });
++      if (task === null) throw new NotFoundException('Task Not Found');
++
++      // NOTE: Already closed is success, so the HR service can retry safely.
++      if (task.status === TaskStatus.CLOSED) return { id: task.id, status: task.status };
++      if (task.status !== TaskStatus.OPEN) throw new BadRequestException(`Task Not Open: ${task.status}`);
++
++      task.status = TaskStatus.CLOSED;
++      await em.flush();
++
++      return { id: task.id, status: task.status };
++    });
++  }
++
++  private async lockMember(memberOpts: { externalId: string }, em: EntityManager): Promise<Member> {
++    const member = await em.findOne(
++      Member,
++      { externalId: memberOpts.externalId },
++      { lockMode: LockMode.PESSIMISTIC_WRITE },
++    );
++    if (member === null) throw new NotFoundException('Member Not Found');
++    return member;
++  }
++}
+diff --git a/src/tasks/tasks.module.ts b/src/tasks/tasks.module.ts
+--- a/src/tasks/tasks.module.ts
++++ b/src/tasks/tasks.module.ts
+@@ -1,9 +1,15 @@
+ import { MikroOrmModule } from '@mikro-orm/nestjs';
+ import { Module } from '@nestjs/common';
++import { ConfigModule } from '@nestjs/config';
++import AuthConfig from '../auth/auth.config';
++import { InternalTaskController } from './controllers/internal.task.controller';
+ import { Member } from './entities/member.entity';
+ import { Task } from './entities/task.entity';
++import { TaskService } from './services/task.service';
+ 
+ @Module({
+-  imports: [MikroOrmModule.forFeature([Task, Member])],
++  imports: [MikroOrmModule.forFeature([Task, Member]), ConfigModule.forFeature(AuthConfig)],
++  controllers: [InternalTaskController],
++  providers: [TaskService],
+ })
+ export class TasksModule {}

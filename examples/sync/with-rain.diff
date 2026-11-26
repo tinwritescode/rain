@@ -1,0 +1,370 @@
+diff --git a/src/app.module.ts b/src/app.module.ts
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,9 +1,11 @@
+ import { MikroOrmModule } from '@mikro-orm/nestjs';
+ import { Module } from '@nestjs/common';
+ import { ConfigModule } from '@nestjs/config';
++import { validate } from './config/env.validation';
++import { GithubModule } from './github/github.module';
+ import { TasksModule } from './tasks/tasks.module';
+ 
+ @Module({
+-  imports: [ConfigModule.forRoot({ isGlobal: true }), MikroOrmModule.forRoot(), TasksModule],
++  imports: [ConfigModule.forRoot({ isGlobal: true, validate }), MikroOrmModule.forRoot(), TasksModule, GithubModule],
+ })
+ export class AppModule {}
+diff --git a/src/common/guards/internal-api-key.guard.ts b/src/common/guards/internal-api-key.guard.ts
+--- a/src/common/guards/internal-api-key.guard.ts
++++ b/src/common/guards/internal-api-key.guard.ts
+@@ -0,0 +1,26 @@
++import { CanActivate, ExecutionContext, ForbiddenException, Inject, Injectable } from '@nestjs/common';
++import { ConfigType } from '@nestjs/config';
++import { timingSafeEqual } from 'crypto';
++
++import InternalConfig from '../internal.config';
++
++@Injectable()
++export class InternalApiKeyGuard implements CanActivate {
++  private readonly key: Buffer;
++
++  constructor(@Inject(InternalConfig.KEY) config: ConfigType<typeof InternalConfig>) {
++    this.key = Buffer.from(config.apiKey);
++  }
++
++  canActivate(context: ExecutionContext): boolean {
++    const request = context.switchToHttp().getRequest<{ headers: Record<string, string | string[] | undefined> }>();
++    const header = request.headers['x-internal-api-key'];
++    const given = Buffer.from(typeof header === 'string' ? header : '');
++
++    // NOTE: Compare equal-length buffers either way so response time does not reveal the key length.
++    const matches = timingSafeEqual(given.length === this.key.length ? given : this.key, this.key);
++    if (given.length !== this.key.length || !matches) throw new ForbiddenException();
++
++    return true;
++  }
++}
+diff --git a/src/common/internal.config.ts b/src/common/internal.config.ts
+--- a/src/common/internal.config.ts
++++ b/src/common/internal.config.ts
+@@ -0,0 +1,6 @@
++import { registerAs } from '@nestjs/config';
++
++export const InternalConfig = registerAs('internal', () => ({
++  apiKey: process.env.INTERNAL_API_KEY!,
++}));
++export default InternalConfig;
+diff --git a/src/config/env.validation.ts b/src/config/env.validation.ts
+--- a/src/config/env.validation.ts
++++ b/src/config/env.validation.ts
+@@ -0,0 +1,32 @@
++import { plainToInstance } from 'class-transformer';
++import { IsNotEmpty, IsString, validateSync } from 'class-validator';
++
++class EnvironmentVariables {
++  @IsNotEmpty()
++  @IsString()
++  GITHUB_TOKEN!: string;
++
++  // GitHub organization whose repositories and labels are mirrored.
++  @IsNotEmpty()
++  @IsString()
++  GITHUB_ORG!: string;
++
++  @IsNotEmpty()
++  @IsString()
++  INTERNAL_API_KEY!: string;
++}
++
++export function validate(config: Record<string, unknown>): Record<string, unknown> {
++  const env = plainToInstance(EnvironmentVariables, config);
++  const errors = validateSync(env, {
++    skipMissingProperties: false,
++    skipNullProperties: false,
++    skipUndefinedProperties: false,
++  });
++  if (errors.length > 0) {
++    const violations = errors.flatMap((error) => Object.values(error.constraints ?? {}));
++    throw new Error(`Invalid environment:\n${violations.join('\n')}`);
++  }
++
++  return config;
++}
+diff --git a/src/github/controllers/internal.github.controller.ts b/src/github/controllers/internal.github.controller.ts
+--- a/src/github/controllers/internal.github.controller.ts
++++ b/src/github/controllers/internal.github.controller.ts
+@@ -0,0 +1,19 @@
++import { Controller, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs/common';
++
++import { InternalApiKeyGuard } from '../../common/guards/internal-api-key.guard';
++import { GithubRepositoryService } from '../services/github-repository.service';
++
++import { InternalGithubRepositorySyncResponseBodyDto } from '../dtos/internal-github-repository-sync-request.dto';
++
++@Controller('internal/github')
++@UseGuards(InternalApiKeyGuard)
++export class InternalGithubController {
++  constructor(private readonly githubRepositoryService: GithubRepositoryService) {}
++
++  // TODO: Also run nightly from a worker cron once a scheduler is in the stack.
++  @Post('repository/sync')
++  @HttpCode(HttpStatus.OK)
++  async syncRepositories(): Promise<InternalGithubRepositorySyncResponseBodyDto> {
++    return await this.githubRepositoryService.syncRepositories();
++  }
++}
+diff --git a/src/github/dtos/internal-github-repository-sync-request.dto.ts b/src/github/dtos/internal-github-repository-sync-request.dto.ts
+--- a/src/github/dtos/internal-github-repository-sync-request.dto.ts
++++ b/src/github/dtos/internal-github-repository-sync-request.dto.ts
+@@ -0,0 +1,4 @@
++export class InternalGithubRepositorySyncResponseBodyDto {
++  repositories!: number;
++  labels!: number;
++}
+diff --git a/src/github/entities/github-label.entity.ts b/src/github/entities/github-label.entity.ts
+--- a/src/github/entities/github-label.entity.ts
++++ b/src/github/entities/github-label.entity.ts
+@@ -0,0 +1,39 @@
++import { Entity, Index, ManyToOne, PrimaryKey, Property } from '@mikro-orm/core';
++import type { RestEndpointMethodTypes } from '@octokit/rest';
++
++import { GithubRepository } from './github-repository.entity';
++
++export type GithubLabelPayload = RestEndpointMethodTypes['issues']['listLabelsForRepo']['response']['data'][number];
++
++@Entity()
++// NOTE: Not unique; a rename and a new label can swap names between syncs.
++@Index({ properties: ['repository', 'name'] })
++export class GithubLabel {
++  @PrimaryKey({ type: 'bigint' })
++  id!: string;
++
++  @Property({ type: 'uuid', defaultRaw: 'gen_random_uuid()', unique: true })
++  uuid!: string;
++
++  @Property({ type: 'text', unique: true, comment: 'GitHub Label ID' })
++  remoteId!: string;
++
++  @ManyToOne(() => GithubRepository)
++  repository!: GithubRepository;
++
++  @Property({ type: 'text' })
++  name!: string;
++
++  @Property({ type: 'json', nullable: true })
++  raw: GithubLabelPayload | null = null;
++
++  // Set by the sync when the label leaves its repository; lookups skip it.
++  @Property({ type: 'datetime', nullable: true })
++  deletedAt: Date | null = null;
++
++  @Property({ type: 'datetime', defaultRaw: 'NOW()' })
++  createdAt!: Date;
++
++  @Property({ type: 'datetime', defaultRaw: 'NOW()', onUpdate: () => new Date() })
++  updatedAt!: Date;
++}
+diff --git a/src/github/entities/github-repository.entity.ts b/src/github/entities/github-repository.entity.ts
+--- a/src/github/entities/github-repository.entity.ts
++++ b/src/github/entities/github-repository.entity.ts
+@@ -0,0 +1,33 @@
++import { Entity, PrimaryKey, Property } from '@mikro-orm/core';
++import type { RestEndpointMethodTypes } from '@octokit/rest';
++
++export type GithubRepositoryPayload = RestEndpointMethodTypes['repos']['listForOrg']['response']['data'][number];
++
++@Entity()
++export class GithubRepository {
++  @PrimaryKey({ type: 'bigint' })
++  id!: string;
++
++  @Property({ type: 'uuid', defaultRaw: 'gen_random_uuid()', unique: true })
++  uuid!: string;
++
++  @Property({ type: 'text', unique: true, comment: 'GitHub Repository ID' })
++  remoteId!: string;
++
++  // NOTE: Not unique; two repositories can swap names between syncs.
++  @Property({ type: 'text', index: true })
++  name!: string;
++
++  @Property({ type: 'json', nullable: true })
++  raw: GithubRepositoryPayload | null = null;
++
++  // Set by the sync when the repository leaves the org listing; label lookups skip it.
++  @Property({ type: 'datetime', nullable: true })
++  deletedAt: Date | null = null;
++
++  @Property({ type: 'datetime', defaultRaw: 'NOW()' })
++  createdAt!: Date;
++
++  @Property({ type: 'datetime', defaultRaw: 'NOW()', onUpdate: () => new Date() })
++  updatedAt!: Date;
++}
+diff --git a/src/github/github.config.ts b/src/github/github.config.ts
+--- a/src/github/github.config.ts
++++ b/src/github/github.config.ts
+@@ -0,0 +1,7 @@
++import { registerAs } from '@nestjs/config';
++
++export const GithubConfig = registerAs('github', () => ({
++  token: process.env.GITHUB_TOKEN!,
++  org: process.env.GITHUB_ORG!,
++}));
++export default GithubConfig;
+diff --git a/src/github/github.module.ts b/src/github/github.module.ts
+--- a/src/github/github.module.ts
++++ b/src/github/github.module.ts
+@@ -0,0 +1,33 @@
++import { MikroOrmModule } from '@mikro-orm/nestjs';
++import { Module } from '@nestjs/common';
++import { ConfigModule, ConfigType } from '@nestjs/config';
++import { Octokit } from '@octokit/rest';
++
++import { InternalGithubController } from './controllers/internal.github.controller';
++import { GithubRepositoryService } from './services/github-repository.service';
++
++import { GithubLabel } from './entities/github-label.entity';
++import { GithubRepository } from './entities/github-repository.entity';
++
++import InternalConfig from '../common/internal.config';
++import GithubConfig from './github.config';
++
++@Module({
++  imports: [
++    ConfigModule.forFeature(GithubConfig),
++    ConfigModule.forFeature(InternalConfig),
++    MikroOrmModule.forFeature([GithubRepository, GithubLabel]),
++  ],
++  controllers: [InternalGithubController],
++  providers: [
++    {
++      provide: Octokit,
++      inject: [GithubConfig.KEY],
++      useFactory: (config: ConfigType<typeof GithubConfig>) => new Octokit({ auth: config.token }),
++    },
++
++    GithubRepositoryService,
++  ],
++  exports: [GithubRepositoryService],
++})
++export class GithubModule {}
+diff --git a/src/github/services/github-repository.service.ts b/src/github/services/github-repository.service.ts
+--- a/src/github/services/github-repository.service.ts
++++ b/src/github/services/github-repository.service.ts
+@@ -0,0 +1,115 @@
++import { EntityManager } from '@mikro-orm/postgresql';
++import { Inject, Injectable } from '@nestjs/common';
++import { ConfigType } from '@nestjs/config';
++import { Octokit } from '@octokit/rest';
++
++import { GithubLabel, GithubLabelPayload } from '../entities/github-label.entity';
++import { GithubRepository, GithubRepositoryPayload } from '../entities/github-repository.entity';
++
++import GithubConfig from '../github.config';
++
++const PAGE_SIZE = 100;
++const SYNC_LOCK_KEY = 'github:repository-sync';
++
++@Injectable()
++export class GithubRepositoryService {
++  constructor(
++    private readonly entityManager: EntityManager,
++    private readonly octokit: Octokit,
++    @Inject(GithubConfig.KEY) private readonly config: ConfigType<typeof GithubConfig>,
++  ) {}
++
++  async findLabel(
++    repositoryOpts: { name: string },
++    labelOpts: { name: string },
++    opts: { em?: EntityManager } = {},
++  ): Promise<GithubLabel | null> {
++    const em = opts.em ?? this.entityManager;
++
++    return await em.findOne(GithubLabel, {
++      name: labelOpts.name,
++      deletedAt: null,
++      repository: { name: repositoryOpts.name, deletedAt: null },
++    });
++  }
++
++  async syncRepositories(): Promise<{ repositories: number; labels: number }> {
++    // NOTE: Read GitHub before opening the transaction so no DB connection idles through API calls.
++    const remote = await this.fetchRemote();
++
++    await this.entityManager.transactional(async (em) => {
++      // WARNING: Serializes overlapping syncs; without it both insert the same remoteId and one fails.
++      await em.execute('SELECT pg_advisory_xact_lock(hashtext(?))', [SYNC_LOCK_KEY]);
++
++      // NOTE: Overlapping syncs apply last-writer-wins; the next run corrects a slightly older snapshot.
++      const localRepositories = await em.find(GithubRepository, {});
++      const localLabels = await em.find(GithubLabel, {});
++      const repositoriesByRemoteId = new Map(localRepositories.map((repository) => [repository.remoteId, repository]));
++      const labelsByRemoteId = new Map(localLabels.map((label) => [label.remoteId, label]));
++      const seenRepositoryRemoteIds = new Set<string>();
++      const seenLabelRemoteIds = new Set<string>();
++
++      for (const { remoteRepository, remoteLabels } of remote) {
++        const repositoryRemoteId = String(remoteRepository.id);
++        const repository = repositoriesByRemoteId.get(repositoryRemoteId) ?? new GithubRepository();
++        repository.remoteId = repositoryRemoteId;
++        repository.name = remoteRepository.name;
++        repository.raw = remoteRepository;
++        repository.deletedAt = null;
++        em.persist(repository);
++        seenRepositoryRemoteIds.add(repositoryRemoteId);
++
++        for (const remoteLabel of remoteLabels) {
++          const labelRemoteId = String(remoteLabel.id);
++          const label = labelsByRemoteId.get(labelRemoteId) ?? new GithubLabel();
++          label.remoteId = labelRemoteId;
++          label.repository = repository;
++          label.name = remoteLabel.name;
++          label.raw = remoteLabel;
++          label.deletedAt = null;
++          em.persist(label);
++          seenLabelRemoteIds.add(labelRemoteId);
++        }
++      }
++
++      // Rows missing from GitHub stay for history but drop out of lookups.
++      const deletedAt = new Date();
++      for (const repository of localRepositories) {
++        if (seenRepositoryRemoteIds.has(repository.remoteId) || repository.deletedAt !== null) continue;
++        repository.deletedAt = deletedAt;
++      }
++      for (const label of localLabels) {
++        if (seenLabelRemoteIds.has(label.remoteId) || label.deletedAt !== null) continue;
++        label.deletedAt = deletedAt;
++      }
++
++      await em.flush();
++    });
++
++    return {
++      repositories: remote.length,
++      labels: remote.reduce((total, { remoteLabels }) => total + remoteLabels.length, 0),
++    };
++  }
++
++  private async fetchRemote(): Promise<
++    { remoteRepository: GithubRepositoryPayload; remoteLabels: GithubLabelPayload[] }[]
++  > {
++    const remoteRepositories = await this.octokit.paginate(this.octokit.rest.repos.listForOrg, {
++      org: this.config.org,
++      per_page: PAGE_SIZE,
++    });
++
++    const remote: { remoteRepository: GithubRepositoryPayload; remoteLabels: GithubLabelPayload[] }[] = [];
++    for (const remoteRepository of remoteRepositories) {
++      const remoteLabels = await this.octokit.paginate(this.octokit.rest.issues.listLabelsForRepo, {
++        owner: this.config.org,
++        repo: remoteRepository.name,
++        per_page: PAGE_SIZE,
++      });
++      remote.push({ remoteRepository, remoteLabels });
++    }
++
++    return remote;
++  }
++}

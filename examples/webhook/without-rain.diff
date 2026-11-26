@@ -1,0 +1,132 @@
+diff --git a/src/main.ts b/src/main.ts
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -0,0 +1,10 @@
++import { NestFactory } from '@nestjs/core';
++import { AppModule } from './app.module';
++
++async function bootstrap(): Promise<void> {
++  // rawBody is required to verify GitHub webhook signatures.
++  const app = await NestFactory.create(AppModule, { rawBody: true });
++  await app.listen(process.env.PORT ?? 3000);
++}
++
++void bootstrap();
+diff --git a/src/tasks/github-webhook.controller.ts b/src/tasks/github-webhook.controller.ts
+--- a/src/tasks/github-webhook.controller.ts
++++ b/src/tasks/github-webhook.controller.ts
+@@ -0,0 +1,61 @@
++import {
++  Body,
++  Controller,
++  Headers,
++  HttpCode,
++  Post,
++  RawBodyRequest,
++  Req,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { createHmac, timingSafeEqual } from 'crypto';
++import { Request } from 'express';
++import { TasksService } from './tasks.service';
++
++// Only the fields of the `pull_request` event payload we use.
++interface PullRequestEvent {
++  action: string;
++  pull_request: { number: number; merged: boolean };
++  repository: { full_name: string };
++}
++
++@Controller('webhooks/github')
++export class GithubWebhookController {
++  constructor(
++    private readonly config: ConfigService,
++    private readonly tasks: TasksService,
++  ) {}
++
++  @Post()
++  @HttpCode(204)
++  async handle(
++    @Req() req: RawBodyRequest<Request>,
++    @Headers('x-github-event') event: string | undefined,
++    @Headers('x-hub-signature-256') signature: string | undefined,
++    @Body() payload: PullRequestEvent,
++  ): Promise<void> {
++    this.verifySignature(req.rawBody, signature);
++
++    // Other events (e.g. `ping`) and non-merge actions are acknowledged and ignored.
++    if (event !== 'pull_request' || payload.action !== 'closed' || !payload.pull_request.merged) {
++      return;
++    }
++
++    await this.tasks.completeTasksForMergedPullRequest(
++      `${payload.repository.full_name}#${payload.pull_request.number}`,
++    );
++  }
++
++  private verifySignature(rawBody: Buffer | undefined, signature: string | undefined): void {
++    if (!rawBody) {
++      throw new Error('Raw request body is unavailable; create the app with { rawBody: true }');
++    }
++    const secret = this.config.getOrThrow<string>('GITHUB_WEBHOOK_SECRET');
++    const expected = Buffer.from(`sha256=${createHmac('sha256', secret).update(rawBody).digest('hex')}`);
++    const received = Buffer.from(signature ?? '');
++    if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
++      throw new UnauthorizedException('Invalid webhook signature');
++    }
++  }
++}
+diff --git a/src/tasks/tasks.module.ts b/src/tasks/tasks.module.ts
+--- a/src/tasks/tasks.module.ts
++++ b/src/tasks/tasks.module.ts
+@@ -2,8 +2,12 @@
+ import { Module } from '@nestjs/common';
+ import { Member } from './entities/member.entity';
+ import { Task } from './entities/task.entity';
++import { GithubWebhookController } from './github-webhook.controller';
++import { TasksService } from './tasks.service';
+ 
+ @Module({
+   imports: [MikroOrmModule.forFeature([Task, Member])],
++  controllers: [GithubWebhookController],
++  providers: [TasksService],
+ })
+ export class TasksModule {}
+diff --git a/src/tasks/tasks.service.ts b/src/tasks/tasks.service.ts
+--- a/src/tasks/tasks.service.ts
++++ b/src/tasks/tasks.service.ts
+@@ -0,0 +1,33 @@
++import { EntityManager, raw } from '@mikro-orm/postgresql';
++import { Injectable } from '@nestjs/common';
++import { Member } from './entities/member.entity';
++import { Task } from './entities/task.entity';
++import { TaskStatus } from './enums/task-status.enum';
++
++@Injectable()
++export class TasksService {
++  constructor(private readonly em: EntityManager) {}
++
++  /**
++   * Marks every open task linked to the pull request as done and credits its assignee.
++   * Safe to call more than once for the same pull request (GitHub redelivers webhooks).
++   */
++  async completeTasksForMergedPullRequest(pullRequestRef: string): Promise<void> {
++    await this.em.transactional(async (em) => {
++      const tasks = await em.find(Task, { githubPullRequest: pullRequestRef, status: TaskStatus.OPEN });
++
++      for (const task of tasks) {
++        // Conditional update so a concurrent delivery cannot complete the same task twice.
++        const updated = await em.nativeUpdate(
++          Task,
++          { id: task.id, status: TaskStatus.OPEN },
++          { status: TaskStatus.DONE },
++        );
++        if (updated === 1 && task.assignee) {
++          // Increment in SQL to avoid lost updates when several tasks finish at once.
++          await em.nativeUpdate(Member, { id: task.assignee.id }, { completedTasks: raw('completed_tasks + 1') });
++        }
++      }
++    });
++  }
++}

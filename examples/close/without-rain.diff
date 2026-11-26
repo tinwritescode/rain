@@ -1,0 +1,100 @@
+diff --git a/src/common/guards/internal-api.guard.ts b/src/common/guards/internal-api.guard.ts
+--- a/src/common/guards/internal-api.guard.ts
++++ b/src/common/guards/internal-api.guard.ts
+@@ -0,0 +1,22 @@
++import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { timingSafeEqual } from 'crypto';
++import type { Request } from 'express';
++
++// Lets through only service-to-service calls that carry the shared INTERNAL_API_TOKEN.
++// Fails closed: if the token is not configured, every request is rejected.
++@Injectable()
++export class InternalApiGuard implements CanActivate {
++  constructor(private readonly config: ConfigService) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    const expected = this.config.get<string>('INTERNAL_API_TOKEN');
++    const given = context.switchToHttp().getRequest<Request>().header('x-internal-token');
++    if (!expected || !given) throw new UnauthorizedException();
++
++    const a = Buffer.from(given);
++    const b = Buffer.from(expected);
++    if (a.length !== b.length || !timingSafeEqual(a, b)) throw new UnauthorizedException();
++    return true;
++  }
++}
+diff --git a/src/tasks/internal-tasks.controller.ts b/src/tasks/internal-tasks.controller.ts
+--- a/src/tasks/internal-tasks.controller.ts
++++ b/src/tasks/internal-tasks.controller.ts
+@@ -0,0 +1,20 @@
++import { Controller, Param, ParseIntPipe, Post, UseGuards } from '@nestjs/common';
++import { InternalApiGuard } from '../common/guards/internal-api.guard';
++import { InternalTasksService } from './internal-tasks.service';
++
++// Service-to-service endpoints; not meant for end users.
++@Controller('internal/members/:externalId/tasks')
++@UseGuards(InternalApiGuard)
++export class InternalTasksController {
++  constructor(private readonly tasks: InternalTasksService) {}
++
++  // Called by the HR service when a member leaves the company.
++  @Post(':taskId/close')
++  async close(
++    @Param('externalId') externalId: string,
++    @Param('taskId', ParseIntPipe) taskId: number,
++  ) {
++    const task = await this.tasks.closeMemberTask(externalId, taskId);
++    return { id: task.id, status: task.status };
++  }
++}
+diff --git a/src/tasks/internal-tasks.service.ts b/src/tasks/internal-tasks.service.ts
+--- a/src/tasks/internal-tasks.service.ts
++++ b/src/tasks/internal-tasks.service.ts
+@@ -0,0 +1,28 @@
++import { EntityManager } from '@mikro-orm/postgresql';
++import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
++import { Member } from './entities/member.entity';
++import { Task } from './entities/task.entity';
++import { TaskStatus } from './enums/task-status.enum';
++
++@Injectable()
++export class InternalTasksService {
++  constructor(private readonly em: EntityManager) {}
++
++  // Closes an open task assigned to the member with the given HR-service id.
++  async closeMemberTask(externalId: string, taskId: number): Promise<Task> {
++    const member = await this.em.findOne(Member, { externalId });
++    if (!member) throw new NotFoundException('Member not found');
++
++    // Conditional update so a concurrent status change cannot be overwritten.
++    const updated = await this.em.nativeUpdate(
++      Task,
++      { id: taskId, assignee: member.id, status: TaskStatus.OPEN },
++      { status: TaskStatus.CLOSED },
++    );
++
++    const task = await this.em.findOne(Task, { id: taskId, assignee: member.id }, { refresh: true });
++    if (!task) throw new NotFoundException('Task not found');
++    if (updated === 0) throw new ConflictException('Only open tasks can be closed');
++    return task;
++  }
++}
+diff --git a/src/tasks/tasks.module.ts b/src/tasks/tasks.module.ts
+--- a/src/tasks/tasks.module.ts
++++ b/src/tasks/tasks.module.ts
+@@ -1,9 +1,14 @@
+ import { MikroOrmModule } from '@mikro-orm/nestjs';
+ import { Module } from '@nestjs/common';
++import { InternalApiGuard } from '../common/guards/internal-api.guard';
+ import { Member } from './entities/member.entity';
+ import { Task } from './entities/task.entity';
++import { InternalTasksController } from './internal-tasks.controller';
++import { InternalTasksService } from './internal-tasks.service';
+ 
+ @Module({
+   imports: [MikroOrmModule.forFeature([Task, Member])],
++  controllers: [InternalTasksController],
++  providers: [InternalTasksService, InternalApiGuard],
+ })
+ export class TasksModule {}

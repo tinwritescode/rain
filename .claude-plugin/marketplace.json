@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rain",
+  "description": "Calm-senior backend mode for AI agents. Boring code that survives 2am.",
+  "owner": {
+    "name": "tinwritescode",
+    "url": "https://github.com/tinwritescode"
+  },
+  "plugins": [
+    {
+      "name": "rain",
+      "description": "Flat, explicit backend code: guard clauses, lock-then-recheck writes, local mirrors of external systems, idempotent webhooks.",
+      "source": "./",
+      "category": "productivity"
+    }
+  ]
+}

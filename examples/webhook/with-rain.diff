@@ -1,0 +1,417 @@
+diff --git a/src/app.module.ts b/src/app.module.ts
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,9 +1,11 @@
+ import { MikroOrmModule } from '@mikro-orm/nestjs';
+ import { Module } from '@nestjs/common';
+ import { ConfigModule } from '@nestjs/config';
++import { validate } from './config/env.validation';
+ import { TasksModule } from './tasks/tasks.module';
++import { WebhookModule } from './webhook/webhook.module';
+ 
+ @Module({
+-  imports: [ConfigModule.forRoot({ isGlobal: true }), MikroOrmModule.forRoot(), TasksModule],
++  imports: [ConfigModule.forRoot({ isGlobal: true, validate }), MikroOrmModule.forRoot(), TasksModule, WebhookModule],
+ })
+ export class AppModule {}
+diff --git a/src/config/env.validation.ts b/src/config/env.validation.ts
+--- a/src/config/env.validation.ts
++++ b/src/config/env.validation.ts
+@@ -0,0 +1,26 @@
++import { plainToInstance } from 'class-transformer';
++import { IsInt, IsNotEmpty, IsOptional, IsString, validateSync } from 'class-validator';
++
++class EnvironmentVariables {
++  @IsOptional()
++  @IsInt()
++  PORT?: number;
++
++  @IsNotEmpty()
++  @IsString()
++  GITHUB_WEBHOOK_SECRET!: string;
++}
++
++// Passed to ConfigModule.forRoot so boot fails listing every invalid variable at once.
++export function validate(config: Record<string, unknown>): EnvironmentVariables {
++  const env = plainToInstance(EnvironmentVariables, config, { enableImplicitConversion: true });
++  const errors = validateSync(env, {
++    skipMissingProperties: false,
++    skipNullProperties: false,
++    skipUndefinedProperties: false,
++  });
++  if (errors.length === 0) return env;
++
++  const messages = errors.flatMap((error) => Object.values(error.constraints ?? {}));
++  throw new Error(`Invalid environment:\n${messages.join('\n')}`);
++}
+diff --git a/src/main.ts b/src/main.ts
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -0,0 +1,15 @@
++import { ValidationPipe } from '@nestjs/common';
++import { NestFactory } from '@nestjs/core';
++
++import { AppModule } from './app.module';
++
++const DEFAULT_PORT = 3000;
++
++async function bootstrap(): Promise<void> {
++  // WARNING: rawBody must stay on; webhook signatures are computed over the exact request bytes.
++  const app = await NestFactory.create(AppModule, { rawBody: true });
++  app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
++  await app.listen(process.env.PORT ?? DEFAULT_PORT);
++}
++
++void bootstrap();
+diff --git a/src/tasks/services/task.service.ts b/src/tasks/services/task.service.ts
+--- a/src/tasks/services/task.service.ts
++++ b/src/tasks/services/task.service.ts
+@@ -0,0 +1,39 @@
++import { EntityManager, LockMode } from '@mikro-orm/postgresql';
++import { Injectable } from '@nestjs/common';
++
++import { Member } from '../entities/member.entity';
++import { Task } from '../entities/task.entity';
++
++import { TaskStatus } from '../enums/task-status.enum';
++
++@Injectable()
++export class TaskService {
++  constructor(private readonly entityManager: EntityManager) {}
++
++  // Called by the GitHub webhook when a linked pull request is merged.
++  async completeByPullRequest(pullRequestOpts: { pullRequest: string }): Promise<void> {
++    await this.entityManager.transactional(async (em) => {
++      // NOTE: FOR UPDATE re-evaluates the status filter after waiting, so a concurrent delivery that already completed a task skips it.
++      const tasks = await em.find(
++        Task,
++        { githubPullRequest: pullRequestOpts.pullRequest, status: TaskStatus.OPEN },
++        { lockMode: LockMode.PESSIMISTIC_WRITE, orderBy: { id: 'asc' } },
++      );
++
++      for (const task of tasks) {
++        task.status = TaskStatus.DONE;
++        if (task.assignee === undefined || task.assignee === null) continue;
++
++        // WARNING: Lock and reload the member before touching the counter, or parallel completions lose increments.
++        const member = await em.findOneOrFail(
++          Member,
++          { id: task.assignee.id },
++          { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
++        );
++        member.completedTasks += 1;
++      }
++
++      await em.flush();
++    });
++  }
++}
+diff --git a/src/tasks/tasks.module.ts b/src/tasks/tasks.module.ts
+--- a/src/tasks/tasks.module.ts
++++ b/src/tasks/tasks.module.ts
+@@ -2,8 +2,11 @@
+ import { Module } from '@nestjs/common';
+ import { Member } from './entities/member.entity';
+ import { Task } from './entities/task.entity';
++import { TaskService } from './services/task.service';
+ 
+ @Module({
+   imports: [MikroOrmModule.forFeature([Task, Member])],
++  providers: [TaskService],
++  exports: [TaskService],
+ })
+ export class TasksModule {}
+diff --git a/src/webhook/controllers/webhook.controller.ts b/src/webhook/controllers/webhook.controller.ts
+--- a/src/webhook/controllers/webhook.controller.ts
++++ b/src/webhook/controllers/webhook.controller.ts
+@@ -0,0 +1,35 @@
++import { IncomingHttpHeaders, IncomingMessage } from 'node:http';
++
++import {
++  BadRequestException,
++  Controller,
++  Headers,
++  HttpCode,
++  HttpStatus,
++  Param,
++  Post,
++  RawBodyRequest,
++  Req,
++} from '@nestjs/common';
++
++import { WebhookService } from '../services/webhook.service';
++
++import { WebhookReceiveRequestParamsDto } from '../dtos/webhook-receive-request.dto';
++
++@Controller('webhook')
++export class WebhookController {
++  constructor(private readonly webhookService: WebhookService) {}
++
++  // Called by GitHub. Public on purpose: the provider signature authenticates each request.
++  @Post(':provider')
++  @HttpCode(HttpStatus.OK)
++  async receive(
++    @Param() params: WebhookReceiveRequestParamsDto,
++    @Req() req: RawBodyRequest<IncomingMessage>,
++    @Headers() headers: IncomingHttpHeaders,
++  ): Promise<void> {
++    if (req.rawBody === undefined) throw new BadRequestException('Missing Body');
++
++    await this.webhookService.processEvent(params.provider, req.rawBody, headers);
++  }
++}
+diff --git a/src/webhook/dtos/webhook-receive-request.dto.ts b/src/webhook/dtos/webhook-receive-request.dto.ts
+--- a/src/webhook/dtos/webhook-receive-request.dto.ts
++++ b/src/webhook/dtos/webhook-receive-request.dto.ts
+@@ -0,0 +1,9 @@
++import { IsEnum, IsNotEmpty } from 'class-validator';
++
++import { WebhookProvider } from '../enums/webhook-provider.enum';
++
++export class WebhookReceiveRequestParamsDto {
++  @IsNotEmpty()
++  @IsEnum(WebhookProvider)
++  provider!: WebhookProvider;
++}
+diff --git a/src/webhook/entities/webhook-delivery.entity.ts b/src/webhook/entities/webhook-delivery.entity.ts
+--- a/src/webhook/entities/webhook-delivery.entity.ts
++++ b/src/webhook/entities/webhook-delivery.entity.ts
+@@ -0,0 +1,34 @@
++import { Entity, Enum, PrimaryKey, Property, Unique } from '@mikro-orm/core';
++
++import { WebhookProvider } from '../enums/webhook-provider.enum';
++
++@Entity()
++@Unique({ properties: ['provider', 'remoteId'] })
++export class WebhookDelivery {
++  @PrimaryKey()
++  id!: number;
++
++  @Enum(() => WebhookProvider)
++  provider!: WebhookProvider;
++
++  @Property({ comment: 'Provider delivery ID (X-GitHub-Delivery for GitHub)' })
++  remoteId!: string;
++
++  // Provider event name, e.g. "pull_request"
++  @Property()
++  event!: string;
++
++  // Raw provider payload, kept so replayEvent can re-dispatch it.
++  @Property({ type: 'json' })
++  payload!: any;
++
++  // Object the event acted on, e.g. the pull request key "owner/repo#123"
++  @Property({ nullable: true })
++  relatedObject?: string;
++
++  @Property({ defaultRaw: 'NOW()' })
++  createdAt!: Date;
++
++  @Property({ defaultRaw: 'NOW()', onUpdate: () => new Date() })
++  updatedAt!: Date;
++}
+diff --git a/src/webhook/enums/webhook-provider.enum.ts b/src/webhook/enums/webhook-provider.enum.ts
+--- a/src/webhook/enums/webhook-provider.enum.ts
++++ b/src/webhook/enums/webhook-provider.enum.ts
+@@ -0,0 +1,4 @@
++// WARNING: Append only. Never rename or remove a value; mark retired ones deprecated.
++export enum WebhookProvider {
++  GITHUB = 'github',
++}
+diff --git a/src/webhook/github.config.ts b/src/webhook/github.config.ts
+--- a/src/webhook/github.config.ts
++++ b/src/webhook/github.config.ts
+@@ -0,0 +1,7 @@
++import { registerAs } from '@nestjs/config';
++
++export const GithubConfig = registerAs('github', () => ({
++  webhookSecret: process.env.GITHUB_WEBHOOK_SECRET!,
++}));
++
++export default GithubConfig;
+diff --git a/src/webhook/services/webhook.service.ts b/src/webhook/services/webhook.service.ts
+--- a/src/webhook/services/webhook.service.ts
++++ b/src/webhook/services/webhook.service.ts
+@@ -0,0 +1,159 @@
++import { createHmac, timingSafeEqual } from 'node:crypto';
++import { IncomingHttpHeaders } from 'node:http';
++
++import { EntityManager } from '@mikro-orm/postgresql';
++import { BadRequestException, Inject, Injectable, Logger, UnauthorizedException } from '@nestjs/common';
++import { ConfigType } from '@nestjs/config';
++
++import { TaskService } from '../../tasks/services/task.service';
++
++import { WebhookDelivery } from '../entities/webhook-delivery.entity';
++
++import { WebhookProvider } from '../enums/webhook-provider.enum';
++
++import GithubConfig from '../github.config';
++
++// Only the fields we read. Reference: https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request
++type GithubPullRequestEvent = {
++  action: string;
++  pull_request: { number: number; merged: boolean };
++  repository: { full_name: string };
++};
++
++@Injectable()
++export class WebhookService {
++  private readonly logger = new Logger(WebhookService.name);
++
++  constructor(
++    private readonly entityManager: EntityManager,
++    private readonly taskService: TaskService,
++    @Inject(GithubConfig.KEY) private readonly githubConfig: ConfigType<typeof GithubConfig>,
++  ) {}
++
++  async processEvent(provider: WebhookProvider, rawBody: Buffer, headers: IncomingHttpHeaders): Promise<void> {
++    switch (provider) {
++      case WebhookProvider.GITHUB:
++        return await this.processGithubEvent(rawBody, headers);
++      default:
++        throw new BadRequestException('Unsupported Provider');
++    }
++  }
++
++  // Re-dispatches a stored delivery, e.g. from the REPL after a bug fix.
++  async replayEvent(id: number): Promise<void> {
++    const delivery = await this.entityManager.findOneOrFail(WebhookDelivery, { id });
++    await this.dispatch(delivery);
++  }
++
++  private async processGithubEvent(rawBody: Buffer, headers: IncomingHttpHeaders): Promise<void> {
++    const deliveryId = this.verifyGithubSignature(rawBody, headers);
++    const event = headers['x-github-event'];
++    if (typeof event !== 'string') throw new BadRequestException('Missing Event Header');
++
++    let delivery = await this.entityManager.findOne(WebhookDelivery, {
++      provider: WebhookProvider.GITHUB,
++      remoteId: deliveryId,
++    });
++    if (delivery === null) {
++      delivery = new WebhookDelivery();
++      delivery.provider = WebhookProvider.GITHUB;
++      delivery.remoteId = deliveryId;
++      delivery.event = event;
++      delivery.payload = this.parseJson(rawBody);
++      await this.entityManager.persist(delivery).flush();
++    }
++
++    // NOTE: A redelivery of a stored event dispatches again; handlers are idempotent.
++    await this.dispatch(delivery);
++  }
++
++  private async dispatch(delivery: WebhookDelivery): Promise<void> {
++    let relatedObject: string | null;
++    switch (delivery.provider) {
++      case WebhookProvider.GITHUB:
++        relatedObject = await this.dispatchGithub(delivery);
++        break;
++      default:
++        throw new BadRequestException('Unsupported Provider');
++    }
++
++    if (relatedObject === null) return;
++    delivery.relatedObject = relatedObject;
++    await this.entityManager.flush();
++  }
++
++  private async dispatchGithub(delivery: WebhookDelivery): Promise<string | null> {
++    switch (delivery.event) {
++      case 'pull_request':
++        return await this.handleGithubPullRequest(delivery.payload as GithubPullRequestEvent);
++      // NOTE: Not needed yet
++      case 'ping':
++      case 'push':
++      case 'pull_request_review':
++      case 'pull_request_review_comment':
++      case 'issues':
++      case 'issue_comment':
++      default:
++        this.logger.log(`Ignored GitHub event ${delivery.event} (delivery ${delivery.remoteId})`);
++        return null;
++    }
++  }
++
++  private async handleGithubPullRequest(payload: GithubPullRequestEvent): Promise<string | null> {
++    switch (payload.action) {
++      case 'closed': {
++        // Closed without merging leaves the task open.
++        if (payload.pull_request.merged !== true) return null;
++
++        // NOTE: Merging is final on GitHub, so event order cannot move a task backwards; no stale-event check needed.
++        // WARNING: Must match the "owner/repo#number" format stored in Task.githubPullRequest, including case.
++        const pullRequest = `${payload.repository.full_name}#${payload.pull_request.number}`;
++        await this.taskService.completeByPullRequest({ pullRequest });
++        return pullRequest;
++      }
++      // NOTE: Not needed yet
++      case 'opened':
++      case 'reopened':
++      case 'edited':
++      case 'synchronize':
++      case 'assigned':
++      case 'unassigned':
++      case 'labeled':
++      case 'unlabeled':
++      case 'ready_for_review':
++      case 'converted_to_draft':
++      case 'review_requested':
++      case 'review_request_removed':
++      default:
++        this.logger.log(`Ignored GitHub pull_request action ${payload.action}`);
++        return null;
++    }
++  }
++
++  private verifyGithubSignature(rawBody: Buffer, headers: IncomingHttpHeaders): string {
++    const deliveryId = headers['x-github-delivery'];
++    const signature = headers['x-hub-signature-256'];
++    if (typeof deliveryId !== 'string' || typeof signature !== 'string') {
++      throw new UnauthorizedException('Invalid Signature');
++    }
++
++    const digest = createHmac('sha256', this.githubConfig.webhookSecret).update(rawBody).digest('hex');
++    const expected = Buffer.from(`sha256=${digest}`);
++    const given = Buffer.from(signature);
++
++    // NOTE: Compare equal-length buffers either way so response time does not reveal the signature length.
++    const matches = timingSafeEqual(given.length === expected.length ? given : expected, expected);
++    if (given.length !== expected.length || !matches) throw new UnauthorizedException('Invalid Signature');
++
++    return deliveryId;
++  }
++
++  private parseJson(rawBody: Buffer): any {
++    try {
++      return JSON.parse(rawBody.toString('utf8'));
++    } catch {
++      // NOTE: The webhook must use content type application/json; a form-encoded body lands here.
++      throw new BadRequestException('Invalid Payload');
++    }
++  }
++}
+diff --git a/src/webhook/webhook.module.ts b/src/webhook/webhook.module.ts
+--- a/src/webhook/webhook.module.ts
++++ b/src/webhook/webhook.module.ts
+@@ -0,0 +1,18 @@
++import { MikroOrmModule } from '@mikro-orm/nestjs';
++import { Module } from '@nestjs/common';
++import { ConfigModule } from '@nestjs/config';
++
++import { TasksModule } from '../tasks/tasks.module';
++
++import { WebhookController } from './controllers/webhook.controller';
++import { WebhookDelivery } from './entities/webhook-delivery.entity';
++import { WebhookService } from './services/webhook.service';
++
++import GithubConfig from './github.config';
++
++@Module({
++  imports: [ConfigModule.forFeature(GithubConfig), MikroOrmModule.forFeature([WebhookDelivery]), TasksModule],
++  controllers: [WebhookController],
++  providers: [WebhookService],
++})
++export class WebhookModule {}

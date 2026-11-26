@@ -1,0 +1,211 @@
+diff --git a/src/app.module.ts b/src/app.module.ts
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,9 +1,10 @@
+ import { MikroOrmModule } from '@mikro-orm/nestjs';
+ import { Module } from '@nestjs/common';
+ import { ConfigModule } from '@nestjs/config';
++import { GithubModule } from './github/github.module';
+ import { TasksModule } from './tasks/tasks.module';
+ 
+ @Module({
+-  imports: [ConfigModule.forRoot({ isGlobal: true }), MikroOrmModule.forRoot(), TasksModule],
++  imports: [ConfigModule.forRoot({ isGlobal: true }), MikroOrmModule.forRoot(), TasksModule, GithubModule],
+ })
+ export class AppModule {}
+diff --git a/src/github/entities/github-label.entity.ts b/src/github/entities/github-label.entity.ts
+--- a/src/github/entities/github-label.entity.ts
++++ b/src/github/entities/github-label.entity.ts
+@@ -0,0 +1,28 @@
++import { BigIntType, Entity, Index, ManyToOne, PrimaryKey, Property, Unique } from '@mikro-orm/core';
++import { GithubRepository } from './github-repository.entity';
++
++@Entity()
++// Not unique: a sync that swaps two label names would trip a unique index mid-flush.
++// GitHub already guarantees one label per name in a repository.
++@Index({ properties: ['repository', 'name'] })
++export class GithubLabel {
++  @PrimaryKey()
++  id!: number;
++
++  // GitHub's own id; stable across renames, so a renamed label keeps its row
++  @Unique()
++  @Property({ type: new BigIntType('number') })
++  githubId!: number;
++
++  @ManyToOne(() => GithubRepository)
++  repository!: GithubRepository;
++
++  @Property()
++  name!: string;
++
++  @Property()
++  color!: string;
++
++  @Property({ type: 'string', nullable: true })
++  description?: string | null;
++}
+diff --git a/src/github/entities/github-repository.entity.ts b/src/github/entities/github-repository.entity.ts
+--- a/src/github/entities/github-repository.entity.ts
++++ b/src/github/entities/github-repository.entity.ts
+@@ -0,0 +1,21 @@
++import { BigIntType, Collection, Entity, Index, OneToMany, PrimaryKey, Property, Unique } from '@mikro-orm/core';
++import { GithubLabel } from './github-label.entity';
++
++@Entity()
++export class GithubRepository {
++  @PrimaryKey()
++  id!: number;
++
++  // GitHub's own id; stable across renames, so the sync matches on it
++  @Unique()
++  @Property({ type: new BigIntType('number') })
++  githubId!: number;
++
++  // repository name inside the org, e.g. "tracker-api"
++  @Index()
++  @Property()
++  name!: string;
++
++  @OneToMany(() => GithubLabel, (label) => label.repository)
++  labels = new Collection<GithubLabel>(this);
++}
+diff --git a/src/github/github-sync.service.ts b/src/github/github-sync.service.ts
+--- a/src/github/github-sync.service.ts
++++ b/src/github/github-sync.service.ts
+@@ -0,0 +1,96 @@
++import { CreateRequestContext, EntityManager } from '@mikro-orm/core';
++import { Injectable, Logger } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { Octokit } from '@octokit/rest';
++import { GithubLabel } from './entities/github-label.entity';
++import { GithubRepository } from './entities/github-repository.entity';
++
++@Injectable()
++export class GithubSyncService {
++  private readonly logger = new Logger(GithubSyncService.name);
++  private readonly octokit: Octokit;
++  private readonly org: string;
++
++  constructor(
++    // named `em` so @CreateRequestContext can find it
++    private readonly em: EntityManager,
++    config: ConfigService,
++  ) {
++    this.octokit = new Octokit({ auth: config.getOrThrow<string>('GITHUB_TOKEN') });
++    this.org = config.getOrThrow<string>('GITHUB_ORG');
++  }
++
++  /**
++   * Mirrors the org's repositories and their labels into the database.
++   * Rows are matched on GitHub ids, so renames update in place; anything gone from GitHub is deleted.
++   */
++  @CreateRequestContext()
++  async sync(): Promise<{ repositories: number; labels: number }> {
++    // Read everything from GitHub before touching the DB, so a failed API call changes nothing.
++    const remoteRepos = await this.octokit.paginate(this.octokit.rest.repos.listForOrg, {
++      org: this.org,
++      type: 'all',
++      per_page: 100,
++    });
++    const remote = [];
++    for (const repo of remoteRepos) {
++      const labels = await this.octokit.paginate(this.octokit.rest.issues.listLabelsForRepo, {
++        owner: this.org,
++        repo: repo.name,
++        per_page: 100,
++      });
++      remote.push({ repo, labels });
++    }
++
++    const repositories = new Map((await this.em.find(GithubRepository, {})).map((r) => [r.githubId, r]));
++    const labels = new Map((await this.em.find(GithubLabel, {})).map((l) => [l.githubId, l]));
++    const seenRepositories = new Set<number>();
++    const seenLabels = new Set<number>();
++
++    for (const { repo, labels: remoteLabels } of remote) {
++      let repository = repositories.get(repo.id);
++      if (repository) {
++        repository.name = repo.name;
++      } else {
++        repository = this.em.create(GithubRepository, { githubId: repo.id, name: repo.name });
++      }
++      seenRepositories.add(repo.id);
++
++      for (const remoteLabel of remoteLabels) {
++        const data = {
++          repository,
++          name: remoteLabel.name,
++          color: remoteLabel.color,
++          description: remoteLabel.description ?? null,
++        };
++        const label = labels.get(remoteLabel.id);
++        if (label) {
++          this.em.assign(label, data);
++        } else {
++          this.em.create(GithubLabel, { githubId: remoteLabel.id, ...data });
++        }
++        seenLabels.add(remoteLabel.id);
++      }
++    }
++
++    // Labels of a removed repository are never seen either, so they go too.
++    for (const [githubId, label] of labels) {
++      if (!seenLabels.has(githubId)) this.em.remove(label);
++    }
++    for (const [githubId, repository] of repositories) {
++      if (!seenRepositories.has(githubId)) this.em.remove(repository);
++    }
++
++    // One flush, one transaction.
++    await this.em.flush();
++
++    const result = { repositories: seenRepositories.size, labels: seenLabels.size };
++    this.logger.log(`Synced ${result.repositories} repositories and ${result.labels} labels from ${this.org}`);
++    return result;
++  }
++
++  /** Finds a synced label by repository name (inside the org) and exact label name. */
++  findLabel(repositoryName: string, labelName: string): Promise<GithubLabel | null> {
++    return this.em.findOne(GithubLabel, { name: labelName, repository: { name: repositoryName } });
++  }
++}
+diff --git a/src/github/github.module.ts b/src/github/github.module.ts
+--- a/src/github/github.module.ts
++++ b/src/github/github.module.ts
+@@ -0,0 +1,12 @@
++import { MikroOrmModule } from '@mikro-orm/nestjs';
++import { Module } from '@nestjs/common';
++import { GithubLabel } from './entities/github-label.entity';
++import { GithubRepository } from './entities/github-repository.entity';
++import { GithubSyncService } from './github-sync.service';
++
++@Module({
++  imports: [MikroOrmModule.forFeature([GithubRepository, GithubLabel])],
++  providers: [GithubSyncService],
++  exports: [GithubSyncService],
++})
++export class GithubModule {}
+diff --git a/src/github/sync-github.ts b/src/github/sync-github.ts
+--- a/src/github/sync-github.ts
++++ b/src/github/sync-github.ts
+@@ -0,0 +1,19 @@
++// Runs the GitHub repository/label sync once and exits.
++// Needs GITHUB_TOKEN and GITHUB_ORG set, plus the usual database config.
++import { NestFactory } from '@nestjs/core';
++import { AppModule } from '../app.module';
++import { GithubSyncService } from './github-sync.service';
++
++async function main() {
++  const app = await NestFactory.createApplicationContext(AppModule);
++  try {
++    await app.get(GithubSyncService).sync();
++  } finally {
++    await app.close();
++  }
++}
++
++main().catch((error) => {
++  console.error(error);
++  process.exitCode = 1;
++});

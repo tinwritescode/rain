@@ -1,0 +1,23 @@
+/* Logo blue (assets/logo.svg). */
+:root {
+  --vp-c-brand-1: #2563eb;
+  --vp-c-brand-2: #1d4ed8;
+  --vp-c-brand-3: #2563eb;
+  --vp-c-brand-soft: rgba(37, 99, 235, 0.14);
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #0f172a 30%, #2563eb);
+}
+
+.dark {
+  --vp-c-brand-1: #60a5fa;
+  --vp-c-brand-2: #93c5fd;
+  --vp-c-brand-3: #2563eb;
+  --vp-home-hero-name-background: linear-gradient(120deg, #f1f5f9 30%, #60a5fa);
+}
+
+/* Markdown below the home features reads like a doc page. */
+.VPHome > .vp-doc {
+  max-width: 880px;
+  margin: 48px auto 96px;
+  padding: 0 24px;
+}

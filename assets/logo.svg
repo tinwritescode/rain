@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="480" height="150" viewBox="0 0 480 150" role="img" aria-label="rAIn">
+  <style>
+    .word { fill: #0f172a; font: 800 104px ui-sans-serif, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; letter-spacing: -3px; }
+    .ai, .drop { fill: #2563eb; }
+    @media (prefers-color-scheme: dark) {
+      .word { fill: #f1f5f9; }
+      .ai, .drop { fill: #60a5fa; }
+    }
+  </style>
+  <g class="drop">
+    <path transform="translate(44 74)" d="M0 -34 C12 -16 22 -4 22 10 A22 22 0 0 1 -22 10 C-22 -4 -12 -16 0 -34 Z"/>
+    <path transform="translate(88 112) scale(0.62)" d="M0 -34 C12 -16 22 -4 22 10 A22 22 0 0 1 -22 10 C-22 -4 -12 -16 0 -34 Z"/>
+    <path transform="translate(86 36) scale(0.42)" opacity="0.55" d="M0 -34 C12 -16 22 -4 22 10 A22 22 0 0 1 -22 10 C-22 -4 -12 -16 0 -34 Z"/>
+  </g>
+  <text class="word" x="128" y="112">r<tspan class="ai">AI</tspan>n</text>
+</svg>

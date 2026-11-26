@@ -1,0 +1,11 @@
+{
+  "name": "rain",
+  "version": "0.1.0",
+  "description": "Calm-senior backend mode. Flat, explicit, boring code that stays correct when two requests land at once.",
+  "author": {
+    "name": "tinwritescode",
+    "url": "https://github.com/tinwritescode"
+  },
+  "license": "MIT",
+  "keywords": ["clean-code", "backend", "nestjs", "concurrency", "webhooks", "code-review"]
+}
