@@ -122,13 +122,16 @@ Run on the without-rAIn close diff, `/rain review` returned **11 findings — 3 
 
 | Area | Rules |
 |---|---|
-| **Shape** | Feature folders with layer subfolders. Caller audience in the name (`internal.task.controller.ts`). One DTO file per endpoint. Thin controllers. |
+| **Shape** | Feature folders with layer subfolders. One verb per service (`TaskCloserService`). Caller audience in the name (`internal.task.controller.ts`). Remote clients in `connectors/`. One DTO file per endpoint. Thin controllers. |
 | **Functions** | Options grouped by concern. One-line guard clauses. Explicit `switch` with a `default` that throws. Named constants. Responses built by hand. |
-| **Data** | `bigint` id inside, `uuid` outside. `refId` + `refType` for rows owned by other services. Append-only status enums. Generated migrations. |
-| **Concurrency** | One transaction per use case. Lock the owner, then refresh and recheck. Every transition is idempotent. |
-| **External systems** | Local mirror with the `raw` payload. Upsert with `??=`. Find-or-create through metadata. Webhooks: verify, persist, dispatch, drop stale events, replay. |
-| **Boundaries** | Env validated at boot. Config per module. Timing-safe secret compares. `/healthz` outside auth. |
-| **Comments & commits** | `TODO:` / `NOTE:` / `WARNING:` / `Reference:`. `TICKET-123: Title Case`, with a separate `(Migration)` commit. |
+| **Data** | `bigint` id inside, `uuid` outside. `refId` + `refType` for rows owned by other services. Unset is `NULL`. Append-only status enums. One squashed, generated migration per change. |
+| **Reads** | Filter, sort and count in the query. One query per batch. Empty lists answer `[]`. |
+| **Concurrency** | Guard the double-click. One transaction per use case, its handle passed to every helper. Lock the owner, then refresh and recheck. Idempotent transitions. Atomic cache counters and locks. |
+| **External systems** | Local mirror with the `raw` payload. Upsert with `??=`. Find-or-create through metadata. Webhooks and queue consumers that skip what they already processed. Totals that self-correct. A sync endpoint for drift. |
+| **Caching** | Permissions read live. Keys scoped by tenant. Invalidate on the event, TTL as the fallback. |
+| **Errors & numbers** | Client mistakes are 4xx. Catch what you name. Decimals for money, `COALESCE` in SQL sums, client time clamped to server now. |
+| **Boundaries** | Env validated at boot. Config per module. Reject bad input instead of repairing it; bound every array and string. Timing-safe secret compares. `/healthz` outside auth. |
+| **Comments & commits** | `TODO:` / `NOTE:` / `WARNING:` / `Reference:`. `TICKET-123: Title Case`, with a separate `(Migration)` commit and review fixes squashed in. |
 
 The rules are framework-agnostic ([`SKILL.md`](skills/rain/SKILL.md)). Concrete NestJS + MikroORM forms are in [`nestjs.md`](skills/rain/nestjs.md), which the agent loads only on NestJS projects. Your repo's own conventions always win.
 

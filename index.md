@@ -27,7 +27,7 @@ features:
   - title: Local mirrors
     details: Each remote object you depend on gets a table with its raw payload, so a lookup never waits on a rate limit.
   - title: /rain review
-    details: Reads a branch diff and every function it touches, then lists violations as file:line | rule | fix, concurrency first.
+    details: Reads a branch diff and every function it touches, then lists findings as file:line | rule | failure | fix, concurrency first.
     link: /examples/review/close-without-rain
     linkText: Sample review
   - title: Honest examples
